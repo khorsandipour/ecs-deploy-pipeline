@@ -1,0 +1,291 @@
+name: Deploy to ECS — Production
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Reason for manual deploy'
+        required: false
+        type: string
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+  ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
+  BACKEND_SERVICE: laravel-backend
+  FRONTEND_SERVICE: nextjs-frontend
+  BACKEND_REPO: app-backend
+  FRONTEND_REPO: app-frontend
+
+jobs:
+
+  # ──────────────────────────────────────
+  # PRE-FLIGHT CHECKS
+  # ──────────────────────────────────────
+  pre-flight:
+    name: Pre-flight checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check ECS cluster is active
+        run: |
+          STATUS=$(aws ecs describe-clusters \
+            --clusters ${{ env.ECS_CLUSTER }} \
+            --query 'clusters[0].status' \
+            --output text)
+
+          if [ "$STATUS" != "ACTIVE" ]; then
+            echo "ECS cluster not active: $STATUS"
+            exit 1
+          fi
+          echo "ECS cluster active: ${{ env.ECS_CLUSTER }}"
+
+      - name: Check ECR repositories exist
+        run: |
+          aws ecr describe-repositories \
+            --repository-names \
+              ${{ env.BACKEND_REPO }} \
+              ${{ env.FRONTEND_REPO }} \
+            --region ${{ env.AWS_REGION }}
+          echo "ECR repositories verified"
+
+  # ──────────────────────────────────────
+  # BUILD & PUSH — BACKEND
+  # ──────────────────────────────────────
+  build-backend:
+    name: Build Laravel backend
+    runs-on: ubuntu-latest
+    needs: pre-flight
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag and push backend image
+        id: build
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          IMAGE_URI="${{ env.ECR_REGISTRY }}/${{ env.BACKEND_REPO }}:${IMAGE_TAG}"
+
+          echo "Building: $IMAGE_URI"
+
+          docker build \
+            --file docker/Dockerfile.backend \
+            --tag "$IMAGE_URI" \
+            --label "git-commit=${{ github.sha }}" \
+            --label "built-at=$(date -u)" \
+            .
+
+          docker push "$IMAGE_URI"
+
+          echo "image=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "Backend image pushed: $IMAGE_URI"
+
+  # ──────────────────────────────────────
+  # BUILD & PUSH — FRONTEND
+  # ──────────────────────────────────────
+  build-frontend:
+    name: Build Next.js frontend
+    runs-on: ubuntu-latest
+    needs: pre-flight
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag and push frontend image
+        id: build
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          IMAGE_URI="${{ env.ECR_REGISTRY }}/${{ env.FRONTEND_REPO }}:${IMAGE_TAG}"
+
+          docker build \
+            --file docker/Dockerfile.frontend \
+            --tag "$IMAGE_URI" \
+            --label "git-commit=${{ github.sha }}" \
+            --label "built-at=$(date -u)" \
+            .
+
+          docker push "$IMAGE_URI"
+
+          echo "image=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "Frontend image pushed: $IMAGE_URI"
+
+  # ──────────────────────────────────────
+  # DEPLOY — BACKEND
+  # ──────────────────────────────────────
+  deploy-backend:
+    name: Deploy Laravel backend
+    runs-on: ubuntu-latest
+    needs: [build-backend, build-frontend]
+    environment: production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.BACKEND_SERVICE }} \
+            --query taskDefinition \
+            > task-def-backend.json
+          echo "Current task definition retrieved"
+
+      - name: Update task definition with new image
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-def-backend.json
+          container-name: laravel-app
+          image: ${{ needs.build-backend.outputs.image }}
+
+      - name: Deploy to ECS — rolling update
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.BACKEND_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+          wait-for-minutes: 10
+
+      - name: Verify backend health
+        run: |
+          echo "Checking backend service stability..."
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.BACKEND_SERVICE }}
+          echo "Backend deployment stable"
+
+  # ──────────────────────────────────────
+  # DEPLOY — FRONTEND
+  # ──────────────────────────────────────
+  deploy-frontend:
+    name: Deploy Next.js frontend
+    runs-on: ubuntu-latest
+    needs: deploy-backend
+    environment: production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.FRONTEND_SERVICE }} \
+            --query taskDefinition \
+            > task-def-frontend.json
+
+      - name: Update task definition with new image
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-def-frontend.json
+          container-name: nextjs-app
+          image: ${{ needs.build-frontend.outputs.image }}
+
+      - name: Deploy to ECS — rolling update
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.FRONTEND_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+          wait-for-minutes: 10
+
+      - name: Verify frontend health
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.FRONTEND_SERVICE }}
+          echo "Frontend deployment stable"
+
+  # ──────────────────────────────────────
+  # POST-DEPLOY SUMMARY
+  # ──────────────────────────────────────
+  summary:
+    name: Deployment summary
+    runs-on: ubuntu-latest
+    needs: [deploy-backend, deploy-frontend]
+    if: always()
+
+    steps:
+      - name: Print summary
+        run: |
+          echo "================================================"
+          echo "DEPLOYMENT SUMMARY"
+          echo "================================================"
+          echo "Commit     : ${{ github.sha }}"
+          echo "Branch     : ${{ github.ref_name }}"
+          echo "Triggered  : ${{ github.event_name }}"
+          echo "Actor      : ${{ github.actor }}"
+          echo "Timestamp  : $(date -u)"
+          echo "Backend    : ${{ needs.deploy-backend.result }}"
+          echo "Frontend   : ${{ needs.deploy-frontend.result }}"
+          echo "================================================"
+
+      - name: Notify on failure
+        if: |
+          needs.deploy-backend.result == 'failure' ||
+          needs.deploy-frontend.result == 'failure'
+        run: |
+          echo "DEPLOYMENT FAILED"
+          echo "Check logs above for details"
+          echo "Run rollback.yml if needed"
+          exit 1
